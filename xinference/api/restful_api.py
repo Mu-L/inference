@@ -46,7 +46,7 @@ from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from sse_starlette.sse import EventSourceResponse
 from starlette.responses import JSONResponse as StarletteJSONResponse
-from starlette.responses import RedirectResponse
+from starlette.responses import PlainTextResponse, RedirectResponse
 from uvicorn import Config, Server
 from xoscar.utils import get_next_port
 
@@ -65,6 +65,7 @@ from ..types import (
     CreateCompletion,
     ImageList,
     PeftModelConfig,
+    VideoList,
     max_tokens_field,
 )
 from .oauth2.auth_service import AuthService
@@ -123,16 +124,27 @@ class TextToImageRequest(BaseModel):
     user: Optional[str] = None
 
 
+class TextToVideoRequest(BaseModel):
+    model: str
+    prompt: Union[str, List[str]] = Field(description="The input to embed.")
+    n: Optional[int] = 1
+    kwargs: Optional[str] = None
+    user: Optional[str] = None
+
+
 class SpeechRequest(BaseModel):
     model: str
     input: str
     voice: Optional[str]
     response_format: Optional[str] = "mp3"
     speed: Optional[float] = 1.0
+    stream: Optional[bool] = False
+    kwargs: Optional[str] = None
 
 
 class RegisterModelRequest(BaseModel):
     model: str
+    worker_ip: Optional[str]
     persist: bool
 
 
@@ -155,6 +167,7 @@ class BuildGradioImageInterfaceRequest(BaseModel):
     model_id: str
     controlnet: Union[None, List[Dict[str, Union[str, None]]]]
     model_revision: str
+    model_ability: List[str]
 
 
 class RESTfulAPI:
@@ -231,6 +244,13 @@ class RESTfulAPI:
             allow_methods=["*"],
             allow_headers=["*"],
         )
+
+        @self._app.exception_handler(500)
+        async def internal_exception_handler(request: Request, exc: Exception):
+            logger.exception("Handling request %s failed: %s", request.url, exc)
+            return PlainTextResponse(
+                status_code=500, content=f"Internal Server Error: {exc}"
+            )
 
         # internal interface
         self._router.add_api_route("/status", self.get_status, methods=["GET"])
@@ -491,10 +511,42 @@ class RESTfulAPI:
             ),
         )
         self._router.add_api_route(
+            "/v1/images/inpainting",
+            self.create_inpainting,
+            methods=["POST"],
+            response_model=ImageList,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/video/generations",
+            self.create_videos,
+            methods=["POST"],
+            response_model=VideoList,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
             "/v1/chat/completions",
             self.create_chat_completion,
             methods=["POST"],
             response_model=ChatCompletion,
+            dependencies=(
+                [Security(self._auth_service, scopes=["models:read"])]
+                if self.is_authenticated()
+                else None
+            ),
+        )
+        self._router.add_api_route(
+            "/v1/flexible/infers",
+            self.create_flexible_infer,
+            methods=["POST"],
             dependencies=(
                 [Security(self._auth_service, scopes=["models:read"])]
                 if self.is_authenticated()
@@ -773,6 +825,7 @@ class RESTfulAPI:
         worker_ip = payload.get("worker_ip", None)
         gpu_idx = payload.get("gpu_idx", None)
         download_hub = payload.get("download_hub", None)
+        model_path = payload.get("model_path", None)
 
         exclude_keys = {
             "model_uid",
@@ -789,6 +842,7 @@ class RESTfulAPI:
             "worker_ip",
             "gpu_idx",
             "download_hub",
+            "model_path",
         }
 
         kwargs = {
@@ -837,6 +891,7 @@ class RESTfulAPI:
                 worker_ip=worker_ip,
                 gpu_idx=gpu_idx,
                 download_hub=download_hub,
+                model_path=model_path,
                 **kwargs,
             )
         except ValueError as ve:
@@ -997,6 +1052,7 @@ class RESTfulAPI:
                 model_revision=body.model_revision,
                 controlnet=body.controlnet,
                 access_token=access_token,
+                model_ability=body.model_ability,
             ).build()
 
             gr.mount_gradio_app(self._app, interface, f"/{model_uid}")
@@ -1286,8 +1342,18 @@ class RESTfulAPI:
             await self._report_error_event(model_uid, str(e))
             raise HTTPException(status_code=500, detail=str(e))
 
-    async def create_speech(self, request: Request) -> Response:
-        body = SpeechRequest.parse_obj(await request.json())
+    async def create_speech(
+        self,
+        request: Request,
+        prompt_speech: Optional[UploadFile] = File(
+            None, media_type="application/octet-stream"
+        ),
+    ) -> Response:
+        if prompt_speech:
+            f = await request.form()
+        else:
+            f = await request.json()
+        body = SpeechRequest.parse_obj(f)
         model_uid = body.model
         try:
             model = await (await self._get_supervisor_ref()).get_model(model_uid)
@@ -1301,13 +1367,26 @@ class RESTfulAPI:
             raise HTTPException(status_code=500, detail=str(e))
 
         try:
+            if body.kwargs is not None:
+                parsed_kwargs = json.loads(body.kwargs)
+            else:
+                parsed_kwargs = {}
+            if prompt_speech is not None:
+                parsed_kwargs["prompt_speech"] = await prompt_speech.read()
             out = await model.speech(
                 input=body.input,
                 voice=body.voice,
                 response_format=body.response_format,
                 speed=body.speed,
+                stream=body.stream,
+                **parsed_kwargs,
             )
-            return Response(media_type="application/octet-stream", content=out)
+            if body.stream:
+                return EventSourceResponse(
+                    media_type="application/octet-stream", content=out
+                )
+            else:
+                return Response(media_type="application/octet-stream", content=out)
         except RuntimeError as re:
             logger.error(re, exc_info=True)
             await self._report_error_event(model_uid, str(re))
@@ -1360,7 +1439,7 @@ class RESTfulAPI:
         negative_prompt: Optional[Union[str, List[str]]] = Form(None),
         n: Optional[int] = Form(1),
         response_format: Optional[str] = Form("url"),
-        size: Optional[str] = Form("1024*1024"),
+        size: Optional[str] = Form(None),
         kwargs: Optional[str] = Form(None),
     ) -> Response:
         model_uid = model
@@ -1393,6 +1472,126 @@ class RESTfulAPI:
         except RuntimeError as re:
             logger.error(re, exc_info=True)
             await self._report_error_event(model_uid, str(re))
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_inpainting(
+        self,
+        model: str = Form(...),
+        image: UploadFile = File(media_type="application/octet-stream"),
+        mask_image: UploadFile = File(media_type="application/octet-stream"),
+        prompt: Optional[Union[str, List[str]]] = Form(None),
+        negative_prompt: Optional[Union[str, List[str]]] = Form(None),
+        n: Optional[int] = Form(1),
+        response_format: Optional[str] = Form("url"),
+        size: Optional[str] = Form(None),
+        kwargs: Optional[str] = Form(None),
+    ) -> Response:
+        model_uid = model
+        try:
+            model_ref = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            if kwargs is not None:
+                parsed_kwargs = json.loads(kwargs)
+            else:
+                parsed_kwargs = {}
+            im = Image.open(image.file)
+            mask_im = Image.open(mask_image.file)
+            if not size:
+                w, h = im.size
+                size = f"{w}*{h}"
+            image_list = await model_ref.inpainting(
+                image=im,
+                mask_image=mask_im,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                n=n,
+                size=size,
+                response_format=response_format,
+                **parsed_kwargs,
+            )
+            return Response(content=image_list, media_type="application/json")
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_flexible_infer(self, request: Request) -> Response:
+        payload = await request.json()
+
+        model_uid = payload.get("model")
+
+        exclude = {
+            "model",
+        }
+        kwargs = {key: value for key, value in payload.items() if key not in exclude}
+
+        try:
+            model = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            result = await model.infer(**kwargs)
+            return Response(result, media_type="application/json")
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            self.handle_request_limit_error(re)
+            raise HTTPException(status_code=400, detail=str(re))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def create_videos(self, request: Request) -> Response:
+        body = TextToVideoRequest.parse_obj(await request.json())
+        model_uid = body.model
+        try:
+            model = await (await self._get_supervisor_ref()).get_model(model_uid)
+        except ValueError as ve:
+            logger.error(str(ve), exc_info=True)
+            await self._report_error_event(model_uid, str(ve))
+            raise HTTPException(status_code=400, detail=str(ve))
+        except Exception as e:
+            logger.error(e, exc_info=True)
+            await self._report_error_event(model_uid, str(e))
+            raise HTTPException(status_code=500, detail=str(e))
+
+        try:
+            kwargs = json.loads(body.kwargs) if body.kwargs else {}
+            video_list = await model.text_to_video(
+                prompt=body.prompt,
+                n=body.n,
+                **kwargs,
+            )
+            return Response(content=video_list, media_type="application/json")
+        except RuntimeError as re:
+            logger.error(re, exc_info=True)
+            await self._report_error_event(model_uid, str(re))
+            self.handle_request_limit_error(re)
             raise HTTPException(status_code=400, detail=str(re))
         except Exception as e:
             logger.error(e, exc_info=True)
@@ -1509,10 +1708,14 @@ class RESTfulAPI:
         if body.tools and body.stream:
             is_vllm = await model.is_vllm_backend()
 
-            if not is_vllm or model_family not in QWEN_TOOL_CALL_FAMILY:
+            if not (
+                (is_vllm and model_family in QWEN_TOOL_CALL_FAMILY)
+                or (not is_vllm and model_family in GLM4_TOOL_CALL_FAMILY)
+            ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Streaming support for tool calls is available only when using vLLM backend and Qwen models.",
+                    detail="Streaming support for tool calls is available only when using "
+                    "Qwen models with vLLM backend or GLM4-chat models without vLLM backend.",
                 )
 
         if body.stream:
@@ -1595,11 +1798,12 @@ class RESTfulAPI:
     async def register_model(self, model_type: str, request: Request) -> JSONResponse:
         body = RegisterModelRequest.parse_obj(await request.json())
         model = body.model
+        worker_ip = body.worker_ip
         persist = body.persist
 
         try:
             await (await self._get_supervisor_ref()).register_model(
-                model_type, model, persist
+                model_type, model, persist, worker_ip
             )
         except ValueError as re:
             logger.error(re, exc_info=True)

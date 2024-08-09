@@ -133,6 +133,7 @@ class ModelActor(xo.StatelessActor):
     async def __pre_destroy__(self):
         from ..model.embedding.core import EmbeddingModel
         from ..model.llm.pytorch.core import PytorchModel as LLMPytorchModel
+        from ..model.llm.sglang.core import SGLANGModel
         from ..model.llm.vllm.core import VLLMModel as LLMVLLMModel
 
         if self.allow_batching():
@@ -145,8 +146,11 @@ class ModelActor(xo.StatelessActor):
                     f"Destroy scheduler actor failed, address: {self.address}, error: {e}"
                 )
 
+        if hasattr(self._model, "stop") and callable(self._model.stop):
+            self._model.stop()
+
         if (
-            isinstance(self._model, (LLMPytorchModel, LLMVLLMModel))
+            isinstance(self._model, (LLMPytorchModel, LLMVLLMModel, SGLANGModel))
             and self._model.model_spec.model_format == "pytorch"
         ) or isinstance(self._model, EmbeddingModel):
             try:
@@ -174,6 +178,7 @@ class ModelActor(xo.StatelessActor):
     ):
         super().__init__()
         from ..model.llm.pytorch.core import PytorchModel
+        from ..model.llm.sglang.core import SGLANGModel
         from ..model.llm.vllm.core import VLLMModel
 
         self._worker_address = worker_address
@@ -187,7 +192,7 @@ class ModelActor(xo.StatelessActor):
         self._current_generator = lambda: None
         self._lock = (
             None
-            if isinstance(self._model, (PytorchModel, VLLMModel))
+            if isinstance(self._model, (PytorchModel, VLLMModel, SGLANGModel))
             else asyncio.locks.Lock()
         )
         self._worker_ref = None
@@ -310,7 +315,7 @@ class ModelActor(xo.StatelessActor):
             )
         )
 
-    def _to_json_generator(self, gen: types.GeneratorType):
+    def _to_generator(self, output_type: str, gen: types.GeneratorType):
         start_time = time.time()
         time_to_first_token = None
         final_usage = None
@@ -318,8 +323,13 @@ class ModelActor(xo.StatelessActor):
             for v in gen:
                 if time_to_first_token is None:
                     time_to_first_token = (time.time() - start_time) * 1000
-                final_usage = v.get("usage", None)
-                v = dict(data=json.dumps(v, ensure_ascii=False))
+                if output_type == "json":
+                    final_usage = v.get("usage", None)
+                    v = dict(data=json.dumps(v, ensure_ascii=False))
+                else:
+                    assert (
+                        output_type == "binary"
+                    ), f"Unknown output type '{output_type}'"
                 yield sse_starlette.sse.ensure_bytes(v, None)
         except OutOfMemoryError:
             logger.exception(
@@ -342,7 +352,7 @@ class ModelActor(xo.StatelessActor):
                 )
                 asyncio.run_coroutine_threadsafe(coro, loop=self._loop)
 
-    async def _to_json_async_gen(self, gen: types.AsyncGeneratorType):
+    async def _to_async_gen(self, output_type: str, gen: types.AsyncGeneratorType):
         start_time = time.time()
         time_to_first_token = None
         final_usage = None
@@ -351,8 +361,13 @@ class ModelActor(xo.StatelessActor):
                 if time_to_first_token is None:
                     time_to_first_token = (time.time() - start_time) * 1000
                 final_usage = v.get("usage", None)
-                v = await asyncio.to_thread(json.dumps, v)
-                v = dict(data=v)  # noqa: F821
+                if output_type == "json":
+                    v = await asyncio.to_thread(json.dumps, v, ensure_ascii=False)
+                    v = dict(data=v)  # noqa: F821
+                else:
+                    assert (
+                        output_type == "binary"
+                    ), f"Unknown output type '{output_type}'"
                 yield await asyncio.to_thread(sse_starlette.sse.ensure_bytes, v, None)
         except OutOfMemoryError:
             logger.exception(
@@ -379,8 +394,14 @@ class ModelActor(xo.StatelessActor):
                 )
             await asyncio.gather(*coros)
 
+    async def _call_wrapper_json(self, fn: Callable, *args, **kwargs):
+        return await self._call_wrapper("json", fn, *args, **kwargs)
+
+    async def _call_wrapper_binary(self, fn: Callable, *args, **kwargs):
+        return await self._call_wrapper("binary", fn, *args, **kwargs)
+
     @oom_check
-    async def _call_wrapper(self, fn: Callable, *args, **kwargs):
+    async def _call_wrapper(self, output_type: str, fn: Callable, *args, **kwargs):
         if self._lock is None:
             if inspect.iscoroutinefunction(fn):
                 ret = await fn(*args, **kwargs)
@@ -397,16 +418,18 @@ class ModelActor(xo.StatelessActor):
             raise Exception("Parallel generation is not supported by ggml.")
 
         if inspect.isgenerator(ret):
-            gen = self._to_json_generator(ret)
+            gen = self._to_generator(output_type, ret)
             self._current_generator = weakref.ref(gen)
             return gen
         if inspect.isasyncgen(ret):
-            gen = self._to_json_async_gen(ret)
+            gen = self._to_async_gen(output_type, ret)
             self._current_generator = weakref.ref(gen)
             return gen
-        if isinstance(ret, bytes):
+        if output_type == "json":
+            return await asyncio.to_thread(json_dumps, ret)
+        else:
+            assert output_type == "binary", f"Unknown output type '{output_type}'"
             return ret
-        return await asyncio.to_thread(json_dumps, ret)
 
     @log_async(logger=logger)
     @request_limit
@@ -419,11 +442,11 @@ class ModelActor(xo.StatelessActor):
         else:
             kwargs.pop("raw_params", None)
             if hasattr(self._model, "generate"):
-                return await self._call_wrapper(
+                return await self._call_wrapper_json(
                     self._model.generate, prompt, *args, **kwargs
                 )
             if hasattr(self._model, "async_generate"):
-                return await self._call_wrapper(
+                return await self._call_wrapper_json(
                     self._model.async_generate, prompt, *args, **kwargs
                 )
             raise AttributeError(f"Model {self._model.model_spec} is not for generate.")
@@ -471,7 +494,7 @@ class ModelActor(xo.StatelessActor):
             queue: Queue[Any] = Queue()
             ret = self._queue_consumer(queue)
             await self._scheduler_ref.add_request(prompt, queue, *args, **kwargs)
-            gen = self._to_json_async_gen(ret)
+            gen = self._to_async_gen("json", ret)
             self._current_generator = weakref.ref(gen)
             return gen
         else:
@@ -502,12 +525,12 @@ class ModelActor(xo.StatelessActor):
             else:
                 kwargs.pop("raw_params", None)
                 if hasattr(self._model, "chat"):
-                    response = await self._call_wrapper(
+                    response = await self._call_wrapper_json(
                         self._model.chat, prompt, *args, **kwargs
                     )
                     return response
                 if hasattr(self._model, "async_chat"):
-                    response = await self._call_wrapper(
+                    response = await self._call_wrapper_json(
                         self._model.async_chat, prompt, *args, **kwargs
                     )
                     return response
@@ -543,7 +566,7 @@ class ModelActor(xo.StatelessActor):
     @request_limit
     async def create_embedding(self, input: Union[str, List[str]], *args, **kwargs):
         if hasattr(self._model, "create_embedding"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_json(
                 self._model.create_embedding, input, *args, **kwargs
             )
 
@@ -565,7 +588,7 @@ class ModelActor(xo.StatelessActor):
         **kwargs,
     ):
         if hasattr(self._model, "rerank"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_json(
                 self._model.rerank,
                 documents,
                 query,
@@ -590,7 +613,7 @@ class ModelActor(xo.StatelessActor):
         timestamp_granularities: Optional[List[str]] = None,
     ):
         if hasattr(self._model, "transcriptions"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_json(
                 self._model.transcriptions,
                 audio,
                 language,
@@ -615,7 +638,7 @@ class ModelActor(xo.StatelessActor):
         timestamp_granularities: Optional[List[str]] = None,
     ):
         if hasattr(self._model, "translations"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_json(
                 self._model.translations,
                 audio,
                 language,
@@ -628,18 +651,30 @@ class ModelActor(xo.StatelessActor):
             f"Model {self._model.model_spec} is not for creating translations."
         )
 
-    @log_async(logger=logger)
+    @log_async(
+        logger=logger,
+        args_formatter=lambda _, kwargs: kwargs.pop("prompt_speech", None),
+    )
     @request_limit
+    @xo.generator
     async def speech(
-        self, input: str, voice: str, response_format: str = "mp3", speed: float = 1.0
+        self,
+        input: str,
+        voice: str,
+        response_format: str = "mp3",
+        speed: float = 1.0,
+        stream: bool = False,
+        **kwargs,
     ):
         if hasattr(self._model, "speech"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_binary(
                 self._model.speech,
                 input,
                 voice,
                 response_format,
                 speed,
+                stream,
+                **kwargs,
             )
         raise AttributeError(
             f"Model {self._model.model_spec} is not for creating speech."
@@ -657,7 +692,7 @@ class ModelActor(xo.StatelessActor):
         **kwargs,
     ):
         if hasattr(self._model, "text_to_image"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_json(
                 self._model.text_to_image,
                 prompt,
                 n,
@@ -676,13 +711,13 @@ class ModelActor(xo.StatelessActor):
         prompt: str,
         negative_prompt: str,
         n: int = 1,
-        size: str = "1024*1024",
+        size: Optional[str] = None,
         response_format: str = "url",
         *args,
         **kwargs,
     ):
         if hasattr(self._model, "image_to_image"):
-            return await self._call_wrapper(
+            return await self._call_wrapper_json(
                 self._model.image_to_image,
                 image,
                 prompt,
@@ -695,6 +730,71 @@ class ModelActor(xo.StatelessActor):
             )
         raise AttributeError(
             f"Model {self._model.model_spec} is not for creating image."
+        )
+
+    async def inpainting(
+        self,
+        image: "PIL.Image",
+        mask_image: "PIL.Image",
+        prompt: str,
+        negative_prompt: str,
+        n: int = 1,
+        size: str = "1024*1024",
+        response_format: str = "url",
+        *args,
+        **kwargs,
+    ):
+        if hasattr(self._model, "inpainting"):
+            return await self._call_wrapper_json(
+                self._model.inpainting,
+                image,
+                mask_image,
+                prompt,
+                negative_prompt,
+                n,
+                size,
+                response_format,
+                *args,
+                **kwargs,
+            )
+        raise AttributeError(
+            f"Model {self._model.model_spec} is not for creating image."
+        )
+
+    @log_async(logger=logger)
+    @request_limit
+    async def infer(
+        self,
+        **kwargs,
+    ):
+        if hasattr(self._model, "infer"):
+            return await self._call_wrapper_json(
+                self._model.infer,
+                **kwargs,
+            )
+        raise AttributeError(
+            f"Model {self._model.model_spec} is not for flexible infer."
+        )
+
+    @log_async(logger=logger)
+    @request_limit
+    async def text_to_video(
+        self,
+        prompt: str,
+        n: int = 1,
+        *args,
+        **kwargs,
+    ):
+        if hasattr(self._model, "text_to_video"):
+            return await self._call_wrapper_json(
+                self._model.text_to_video,
+                prompt,
+                n,
+                *args,
+                **kwargs,
+            )
+        raise AttributeError(
+            f"Model {self._model.model_spec} is not for creating video."
         )
 
     async def record_metrics(self, name, op, kwargs):

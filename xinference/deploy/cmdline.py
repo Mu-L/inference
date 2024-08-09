@@ -25,7 +25,6 @@ from xoscar.utils import get_next_port
 from .. import __version__
 from ..client import RESTfulClient
 from ..client.restful.restful_client import (
-    RESTfulChatglmCppChatModelHandle,
     RESTfulChatModelHandle,
     RESTfulGenerateModelHandle,
 )
@@ -371,6 +370,9 @@ def worker(
 )
 @click.option("--file", "-f", type=str, help="Path to the model configuration file.")
 @click.option(
+    "--worker-ip", "-w", type=str, help="Specify the ip address of the worker."
+)
+@click.option(
     "--persist",
     "-p",
     is_flag=True,
@@ -387,6 +389,7 @@ def register_model(
     endpoint: Optional[str],
     model_type: str,
     file: str,
+    worker_ip: str,
     persist: bool,
     api_key: Optional[str],
 ):
@@ -400,6 +403,7 @@ def register_model(
     client.register_model(
         model_type=model_type,
         model=model,
+        worker_ip=worker_ip,
         persist=persist,
     )
 
@@ -1263,9 +1267,7 @@ def model_chat(
                 task.exception()
     else:
         restful_model = client.get_model(model_uid=model_uid)
-        if not isinstance(
-            restful_model, (RESTfulChatModelHandle, RESTfulChatglmCppChatModelHandle)
-        ):
+        if not isinstance(restful_model, RESTfulChatModelHandle):
             raise ValueError(f"model {model_uid} has no chat method")
 
         while True:

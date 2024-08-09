@@ -52,6 +52,16 @@ class ImageList(TypedDict):
     data: List[Image]
 
 
+class Video(TypedDict):
+    url: Optional[str]
+    b64_json: Optional[str]
+
+
+class VideoList(TypedDict):
+    created: int
+    data: List[Video]
+
+
 class EmbeddingUsage(TypedDict):
     prompt_tokens: int
     total_tokens: int
@@ -206,30 +216,6 @@ class ChatCompletionChunk(TypedDict):
     usage: NotRequired[CompletionUsage]
 
 
-class ChatglmCppModelConfig(TypedDict, total=False):
-    pass
-
-
-class ChatglmCppGenerateConfig(TypedDict, total=False):
-    max_tokens: int
-    top_p: float
-    temperature: float
-    stream: bool
-    lora_name: Optional[str]
-    stream_options: Optional[Union[dict, None]]
-
-
-class QWenCppModelConfig(TypedDict, total=False):
-    pass
-
-
-class QWenCppGenerateConfig(TypedDict, total=False):
-    max_tokens: int
-    top_p: float
-    temperature: float
-    stream: bool
-
-
 StoppingCriteria = Callable[[List[int], List[float]], bool]
 
 
@@ -285,7 +271,6 @@ class LlamaCppModelConfig(TypedDict, total=False):
     vocab_only: bool
     use_mmap: bool
     use_mlock: bool
-    embedding: bool
     n_threads: Optional[int]
     n_batch: int
     last_n_tokens_size: int
